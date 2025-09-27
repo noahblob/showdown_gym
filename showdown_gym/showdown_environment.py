@@ -12,6 +12,7 @@ from poke_env import (
 from poke_env.battle import AbstractBattle
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from poke_env.player.player import Player
+from poke_env.data.gen_data import GenData
 
 from showdown_gym.base_environment import BaseShowdownEnv
 
@@ -48,47 +49,84 @@ class ShowdownEnvironment(BaseShowdownEnv):
         """
         Calculates the reward based on the changes in state of the battle.
 
-        You need to implement this method to define how the reward is calculated
+        This reward function is designed to beat max damage bots by incentivizing:
+        1. Dealing damage while minimizing damage taken
+        2. Winning battles with large bonuses
+        3. Keeping Pokemon alive for strategic advantage
+        4. Making progress toward victory
 
         Args:
             battle (AbstractBattle): The current battle instance containing information
                 about the player's team and the opponent's team from the player's perspective.
-            prior_battle (AbstractBattle): The prior battle instance to compare against.
         Returns:
             float: The calculated reward based on the change in state of the battle.
         """
 
         prior_battle = self._get_prior_battle(battle)
-
         reward = 0.0
 
+        # Battle outcome rewards (highest priority)
+        if battle.battle_tag and battle.finished:
+            if battle.won:
+                reward += 10.0  # Large reward for winning
+            else:
+                reward -= 5.0  # Penalty for losing
+            return reward
+
+        # Only calculate incremental rewards if we have a prior state
+        if prior_battle is None:
+            return 0.0
+
+        # Get current and prior health states
         health_team = [mon.current_hp_fraction for mon in battle.team.values()]
         health_opponent = [
             mon.current_hp_fraction for mon in battle.opponent_team.values()
         ]
 
-        # If the opponent has less than 6 Pokémon, fill the missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
+        prior_health_team = [
+            mon.current_hp_fraction for mon in prior_battle.team.values()
+        ]
+        prior_health_opponent = [
+            mon.current_hp_fraction for mon in prior_battle.opponent_team.values()
+        ]
 
-        prior_health_opponent = []
-        if prior_battle is not None:
-            prior_health_opponent = [
-                mon.current_hp_fraction for mon in prior_battle.opponent_team.values()
-            ]
+        # Ensure consistent array lengths (pad with 1.0 for missing Pokemon)
+        max_team_size = max(len(health_team), len(prior_health_team))
+        health_team.extend([1.0] * (max_team_size - len(health_team)))
+        prior_health_team.extend([1.0] * (max_team_size - len(prior_health_team)))
 
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(prior_health_opponent) < len(health_team):
-            prior_health_opponent.extend(
-                [1.0] * (len(health_team) - len(prior_health_opponent))
-            )
-
-        diff_health_opponent = np.array(prior_health_opponent) - np.array(
-            health_opponent
+        max_opp_size = max(len(health_opponent), len(prior_health_opponent))
+        health_opponent.extend([1.0] * (max_opp_size - len(health_opponent)))
+        prior_health_opponent.extend(
+            [1.0] * (max_opp_size - len(prior_health_opponent))
         )
 
-        # Reward for reducing the opponent's health
-        reward += np.sum(diff_health_opponent)
+        # Calculate health changes
+        team_damage_taken = np.sum(np.array(prior_health_team) - np.array(health_team))
+        opponent_damage_dealt = np.sum(
+            np.array(prior_health_opponent) - np.array(health_opponent)
+        )
+
+        # Reward damage dealt to opponent (positive)
+        reward += opponent_damage_dealt * 2.0
+
+        # Penalty for damage taken (negative, but smaller magnitude to encourage aggression)
+        reward -= team_damage_taken * 1.0
+
+        # Bonus for favorable damage trades (dealt more than received)
+        if opponent_damage_dealt > team_damage_taken:
+            reward += (opponent_damage_dealt - team_damage_taken) * 0.5
+
+        # Count Pokemon fainted (KO bonuses/penalties)
+        team_fainted = sum(1 for hp in health_team if hp == 0) - sum(
+            1 for hp in prior_health_team if hp == 0
+        )
+        opp_fainted = sum(1 for hp in health_opponent if hp == 0) - sum(
+            1 for hp in prior_health_opponent if hp == 0
+        )
+
+        reward += opp_fainted * 3.0  # Large bonus for KO'ing opponent Pokemon
+        reward -= team_fainted * 2.0  # Penalty for losing Pokemon
 
         return reward
 
@@ -96,54 +134,141 @@ class ShowdownEnvironment(BaseShowdownEnv):
         """
         Returns the size of the observation size to create the observation space for all possible agents in the environment.
 
-        You need to set obvervation size to the number of features you want to include in the observation.
-        Annoyingly, you need to set this manually based on the features you want to include in the observation from emded_battle.
+        The observation includes:
+        - 6 features: our team health fractions
+        - 6 features: opponent team health fractions
+        - 8 strategic features: speed advantage, type effectiveness, resistance, move power,
+          status conditions, and team sizes
+        Total: 6 + 6 + 8 = 20 features
 
         Returns:
-            int: The size of the observation space.
+            int: The size of the observation space (20).
         """
 
-        # Simply change this number to the number of features you want to include in the observation from embed_battle.
-        # If you find a way to automate this, please let me know!
-        return 12
+        return 20
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
         Embeds the current state of a Pokémon battle into a numerical vector representation.
-        This method generates a feature vector that represents the current state of the battle,
-        this is used by the agent to make decisions.
 
-        You need to implement this method to define how the battle state is represented.
+        This embedding provides strategic information to help beat max damage bots:
+        - Health information for decision making
+        - Type effectiveness for resistance/advantage
+        - Speed comparison for turn order decisions
+        - Active Pokemon information for switching decisions
 
         Args:
             battle (AbstractBattle): The current battle instance containing information about
                 the player's team and the opponent's team.
         Returns:
-            np.float32: A 1D numpy array containing the state you want the agent to observe.
+            np.float32: A 1D numpy array containing the strategic battle state features.
         """
+        
+        type_chart = GenData.from_gen(9).type_chart
 
+        # Basic health information
         health_team = [mon.current_hp_fraction for mon in battle.team.values()]
         health_opponent = [
             mon.current_hp_fraction for mon in battle.opponent_team.values()
         ]
 
-        # Ensure health_opponent has 6 components, filling missing values with 1.0 (fraction of health)
-        if len(health_opponent) < len(health_team):
-            health_opponent.extend([1.0] * (len(health_team) - len(health_opponent)))
+        # Pad health arrays to ensure consistent size (assuming max 6 Pokemon)
+        health_team.extend([0.0] * (6 - len(health_team)))
+        health_opponent.extend([0.0] * (6 - len(health_opponent)))
 
-        #########################################################################################################
-        # Caluclate the length of the final_vector and make sure to update the value in _observation_size above #
-        #########################################################################################################
+        # Active Pokemon information
+        active_mon = battle.active_pokemon
+        opp_active_mon = battle.opponent_active_pokemon
 
-        # Final vector - single array with health of both teams
+        # Speed comparison (normalized) - helps with switching decisions
+        speed_advantage = 0.0
+        if active_mon and opp_active_mon and opp_active_mon.stats.get("spe"):
+            our_speed = active_mon.stats.get("spe", 100)
+            opp_speed = opp_active_mon.stats.get("spe", 100)
+            # Normalize speed difference to [-1, 1] range
+            speed_advantage = min(max((our_speed - opp_speed) / 200.0, -1.0), 1.0)
+
+        # Type effectiveness of our active Pokemon against opponent
+        type_advantage = 0.0
+        if active_mon and opp_active_mon:
+            # Calculate average type effectiveness of our types against opponent
+            our_types = active_mon.types
+            opp_types = opp_active_mon.types
+            if our_types and opp_types:
+                effectiveness_values = []
+                for our_type in our_types:
+                    for opp_type in opp_types:
+                        # This is a simplified type effectiveness calculation
+                        # In a real implementation, you'd want to use the actual type chart
+                        effectiveness = our_type.damage_multiplier(opp_type, type_chart=type_chart)
+                        effectiveness_values.append(effectiveness)
+                if effectiveness_values:
+                    # Convert to log scale and normalize: 0.25->-1, 0.5->-0.5, 1->0, 2->0.5, 4->1
+                    avg_effectiveness = np.mean(effectiveness_values)
+                    type_advantage = (
+                        min(max(np.log2(avg_effectiveness), -2.0), 2.0) / 2.0
+                    )
+
+        # Type resistance (how well we resist opponent's attacks)
+        type_resistance = 0.0
+        if active_mon and opp_active_mon:
+            # Calculate how resistant we are to opponent's types
+            resistance_values = []
+            for opp_type in opp_active_mon.types:
+                for our_type in active_mon.types:
+                    resistance = opp_type.damage_multiplier(our_type, type_chart=type_chart)
+                    resistance_values.append(resistance)
+            if resistance_values:
+                avg_resistance = np.mean(resistance_values)
+                # Invert and normalize: 4x damage taken -> -1, 2x -> -0.5, 1x -> 0, 0.5x -> 0.5, 0.25x -> 1
+                type_resistance = min(max(-np.log2(avg_resistance), -2.0), 2.0) / 2.0
+
+        # Available moves power (normalized average)
+        avg_move_power = 0.0
+        if active_mon and active_mon.moves:
+            move_powers = []
+            for move in active_mon.moves.values():
+                if move.base_power:
+                    move_powers.append(move.base_power)
+            if move_powers:
+                avg_move_power = min(
+                    np.mean(move_powers) / 120.0, 1.0
+                )  # Normalize to [0,1]
+
+        # Status condition indicators
+        our_status = 0.0
+        opp_status = 0.0
+        if active_mon:
+            our_status = 1.0 if active_mon.status else 0.0
+        if opp_active_mon:
+            opp_status = 1.0 if opp_active_mon.status else 0.0
+
+        # Team size remaining (normalized)
+        team_alive = sum(1 for hp in health_team if hp > 0) / 6.0
+        opp_alive = sum(1 for hp in health_opponent if hp > 0) / 6.0
+
+        # Combine all features
+        strategic_features = [
+            speed_advantage,  # -1 to 1: negative means opponent is faster
+            type_advantage,  # -1 to 1: positive means our attacks are effective
+            type_resistance,  # -1 to 1: positive means we resist their attacks
+            avg_move_power,  # 0 to 1: normalized average move power
+            our_status,  # 0 or 1: whether we have status condition
+            opp_status,  # 0 or 1: whether opponent has status condition
+            team_alive,  # 0 to 1: fraction of our team alive
+            opp_alive,  # 0 to 1: fraction of opponent team alive
+        ]
+
+        # Final vector combines health info and strategic features
         final_vector = np.concatenate(
             [
-                health_team,  # N components for the health of each pokemon
-                health_opponent,  # N components for the health of opponent pokemon
+                health_team,  # 6 features: our team health
+                health_opponent,  # 6 features: opponent team health
+                strategic_features,  # 8 features: strategic information
             ]
         )
 
-        return final_vector
+        return np.array(final_vector, dtype=np.float32)
 
 
 ########################################
