@@ -35,6 +35,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         )
 
         self.rl_agent = account_name_one
+        self.allowed_actions = list(range(-2, 10)) + list(range(22, 26))
 
     def _get_action_size(self) -> int | None:
         """
@@ -44,7 +45,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         This should return the number of actions you wish to use if not using the default action scheme.
         """
-        return None  # Return None if action size is default
+        return len(self.allowed_actions)  # Return None if action size is default
 
     def process_action(self, action: np.int64) -> np.int64:
         """
@@ -66,7 +67,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
         :return: The battle order ID for the given action in context of the current battle.
         :rtype: np.Int64
         """
-        return action
+        idx = int(action)
+        if idx < 0 or idx >= len(self.allowed_actions):
+            raise ValueError(f"Invalid action index: {idx}")
+        return np.int64(self.allowed_actions[idx])
 
     def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
         info = super().get_additional_info()
@@ -103,9 +107,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # Battle outcome rewards (highest priority)
         if battle.battle_tag and battle.finished:
             if battle.won:
-                reward += 10.0  # Large reward for winning
+                reward += 25  # Large reward for winning
             else:
-                reward -= 5.0  # Penalty for losing
+                reward -= 20  # Penalty for losing
             return reward
 
         # Only calculate incremental rewards if we have a prior state
@@ -198,7 +202,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         Returns:
             np.float32: A 1D numpy array containing the strategic battle state features.
         """
-        
+
         type_chart = GenData.from_gen(9).type_chart
 
         # Basic health information
@@ -235,7 +239,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
                     for opp_type in opp_types:
                         # This is a simplified type effectiveness calculation
                         # In a real implementation, you'd want to use the actual type chart
-                        effectiveness = our_type.damage_multiplier(opp_type, type_chart=type_chart)
+                        effectiveness = our_type.damage_multiplier(
+                            opp_type, type_chart=type_chart
+                        )
                         effectiveness_values.append(effectiveness)
                 if effectiveness_values:
                     # Convert to log scale and normalize: 0.25->-1, 0.5->-0.5, 1->0, 2->0.5, 4->1
@@ -251,7 +257,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
             resistance_values = []
             for opp_type in opp_active_mon.types:
                 for our_type in active_mon.types:
-                    resistance = opp_type.damage_multiplier(our_type, type_chart=type_chart)
+                    resistance = opp_type.damage_multiplier(
+                        our_type, type_chart=type_chart
+                    )
                     resistance_values.append(resistance)
             if resistance_values:
                 avg_resistance = np.mean(resistance_values)
