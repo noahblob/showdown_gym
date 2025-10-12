@@ -27,6 +27,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
         account_name_two: str = "train_two",
         team: str | None = None,
     ):
+        self.allowed_actions = list(range(-2, 10)) + list(range(22, 26))
+        
         super().__init__(
             battle_format=battle_format,
             account_name_one=account_name_one,
@@ -35,7 +37,6 @@ class ShowdownEnvironment(BaseShowdownEnv):
         )
 
         self.rl_agent = account_name_one
-        self.allowed_actions = list(range(-2, 10)) + list(range(22, 26))
 
     def _get_action_size(self) -> int | None:
         """
