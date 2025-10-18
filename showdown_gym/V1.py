@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 
 import numpy as np
 from poke_env import (
@@ -14,16 +14,6 @@ from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from poke_env.environment.singles_env import ObsType
 from poke_env.player.player import Player
 from poke_env.data.gen_data import GenData
-
-# Defensive imports for enums/constants that may differ across poke-env versions
-try:
-    from poke_env.environment.field import Field
-    from poke_env.environment.side_condition import SideCondition
-    from poke_env.environment.weather import Weather
-except Exception:
-    Field = object  # type: ignore
-    SideCondition = object  # type: ignore
-    Weather = object  # type: ignore
 
 from showdown_gym.base_environment import BaseShowdownEnv
 
@@ -47,34 +37,6 @@ class ShowdownEnvironment(BaseShowdownEnv):
         )
 
         self.rl_agent = account_name_one
-
-        # Cache Gen 9 data for mappings (species, moves, items, abilities, types)
-        self._gen_data = GenData.from_gen(9)
-        self._species_index = {k.lower(): i for i, k in enumerate(sorted(self._gen_data.species))}
-        self._ability_index = {k.lower(): i for i, k in enumerate(sorted(self._gen_data.abilities))}
-        self._item_index = {k.lower(): i for i, k in enumerate(sorted(self._gen_data.items))}
-        self._move_index = {k.lower(): i for i, k in enumerate(sorted(self._gen_data.moves))}
-        self._types = sorted(self._gen_data.type_chart.keys())
-        # Some repos use "snow" replacing "hail" in gen9; we still encode into the hail channel.
-        self._type_to_idx = {t.lower(): i for i, t in enumerate(self._types)}
-
-        # Volatile effects list (38 entries). If an effect name here is present on the Pokémon,
-        # we mark it ON. Fill to 38 if your list changes.
-        self._volatile_names: List[str] = [
-            # common general-purpose volatiles
-            "confusion", "attract", "substitute", "leechseed", "perishsong", "ingrain", "aqua ring",
-            "curse", "disable", "encore", "taunt", "torment", "embargo", "imprison", "nightmare",
-            "yawn", "telekinesis", "healblock", "foresight", "miracle eye", "magnet rise",
-            "power trick", "trap", "partialtrap", "spite", "flashfire", "slowstart", "drowsy",
-            "focusenergy", "stockpile1", "stockpile2", "stockpile3", "substitutebroken",
-            # two-turn move preparations (preparing)
-            "fly", "bounce", "dig", "dive", "shadowforce", "phantomforce",
-        ]
-        # pad to exactly 38 entries if necessary
-        if len(self._volatile_names) < 38:
-            self._volatile_names += [f"custom_{i}" for i in range(38 - len(self._volatile_names))]
-        elif len(self._volatile_names) > 38:
-            self._volatile_names = self._volatile_names[:38]
 
     def _get_action_size(self) -> int | None:
         """
@@ -208,592 +170,149 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         return reward
 
-    # =======================
-    # Appendix A encoders
-    # =======================
-
     def _observation_size(self) -> int:
-        # 125 non-Pokémon features + 12 * 300 per-Pokémon features
-        return 125 + 12 * 300
-
-    @staticmethod
-    def _one_hot(index: int, length: int) -> np.ndarray:
-        v = np.zeros(length, dtype=np.float32)
-        if 0 <= index < length:
-            v[index] = 1.0
-        return v
-
-    @staticmethod
-    def _presence_one_hot(present: bool) -> np.ndarray:
-        return np.array([1.0, 0.0], dtype=np.float32) if not present else np.array([0.0, 1.0], dtype=np.float32)
-
-    @staticmethod
-    def _bin_hp_fraction(hp_frac: float) -> np.ndarray:
-        # 7 bins: bin0 for 0 HP (fainted), bins 1..6 for (0,1] equally sized
-        if hp_frac <= 0.0:
-            return ShowdownEnvironment._one_hot(0, 7)
-        # Map (0,1] -> 1..6
-        idx = int(np.ceil(np.clip(hp_frac, 1e-6, 1.0) * 6.0))
-        idx = int(np.clip(idx, 1, 6))
-        return ShowdownEnvironment._one_hot(idx, 7)
-
-    @staticmethod
-    def _get_dict_value(d: Any, key: Any, default: int = 0) -> int:
-        try:
-            if hasattr(d, "get"):
-                return int(d.get(key, default))
-            if isinstance(d, dict):
-                return int(d.get(key, default))
-        except Exception:
-            pass
-        return default
-
-    def _encode_weather_block(self, battle: AbstractBattle) -> np.ndarray:
-        # Weather: 4 * 9 onehots + 1 bit for "no weather" => 37 dims
-        def encode_cond(active_turns: Optional[int], permanent: bool = False) -> np.ndarray:
-            if permanent:
-                return self._one_hot(8, 9)
-            if active_turns and active_turns > 0:
-                return self._one_hot(min(active_turns - 1, 7), 9)
-            return np.zeros(9, dtype=np.float32)
-
-        weather_map = getattr(battle, "weather", None)
-
-        sun_turns = 0
-        rain_turns = 0
-        hail_turns = 0
-        sand_turns = 0
-        try:
-            if weather_map:
-                sun_turns = self._get_dict_value(weather_map, getattr(Weather, "SUNNYDAY", "sunnyday"), 0)
-                rain_turns = self._get_dict_value(weather_map, getattr(Weather, "RAINDANCE", "raindance"), 0)
-                hail_turns = max(
-                    self._get_dict_value(weather_map, getattr(Weather, "HAIL", "hail"), 0),
-                    self._get_dict_value(weather_map, getattr(Weather, "SNOW", "snow"), 0),
-                )
-                sand_turns = self._get_dict_value(weather_map, getattr(Weather, "SANDSTORM", "sandstorm"), 0)
-        except Exception:
-            pass
-
-        # Permanent flags (mostly Gen 3-5); set false by default in Gen 9
-        sun_perm = False
-        rain_perm = False
-        hail_perm = False
-        sand_perm = False
-
-        parts = [
-            encode_cond(sun_turns, sun_perm),
-            encode_cond(rain_turns, rain_perm),
-            encode_cond(hail_turns, hail_perm),
-            encode_cond(sand_turns, sand_perm),
-        ]
-        no_weather = 1.0 if (sun_turns + rain_turns + hail_turns + sand_turns) == 0 else 0.0
-        return np.concatenate([*parts, np.array([no_weather], dtype=np.float32)])
-
-    def _encode_trick_room(self, battle: AbstractBattle) -> np.ndarray:
-        fields = getattr(battle, "fields", {}) or {}
-        turns = 0
-        try:
-            turns = self._get_dict_value(fields, getattr(Field, "TRICK_ROOM", "trickroom"), 0)
-        except Exception:
-            pass
-        # 7 bins: 0..5 for 1..6 turns, 6 for none
-        if turns <= 0:
-            return self._one_hot(6, 7)
-        return self._one_hot(min(turns - 1, 5), 7)
-
-    def _encode_force_switch(self, battle: AbstractBattle) -> np.ndarray:
-        us_forced = 1.0 if getattr(battle, "must_switch", False) else 0.0
-        opp_forced = 0.0  # Not directly exposed; default 0
-        return np.array([us_forced, opp_forced], dtype=np.float32)
-
-    def _encode_hazards_and_screens(self, battle: AbstractBattle) -> np.ndarray:
-        # Per side: SR (2), Spikes (4), TSpikes (3), Reflect (10), Light Screen (10), Safeguard (7) => 36
-        # Both sides => 72
-        def get_side_dict(ours: bool) -> dict:
-            key = "side_conditions" if ours else "opponent_side_conditions"
-            return getattr(battle, key, {}) or {}
-
-        def spikes_onehot(levels: int) -> np.ndarray:
-            return self._one_hot(int(np.clip(levels, 0, 3)), 4)
-
-        def tspikes_onehot(levels: int) -> np.ndarray:
-            return self._one_hot(int(np.clip(levels, 0, 2)), 3)
-
-        def duration_onehot(turns: int, length: int) -> np.ndarray:
-            if turns <= 0:
-                return self._one_hot(length - 1, length)  # last is "none"
-            return self._one_hot(int(np.clip(turns - 1, 0, length - 2)), length)
-
-        parts: List[np.ndarray] = []
-        for ours in (True, False):
-            sd = get_side_dict(ours)
-            # Stealth Rock
-            try:
-                sr_present = getattr(SideCondition, "STEALTH_ROCK", "stealthrock") in sd
-            except Exception:
-                sr_present = ("stealthrock" in sd) or self._get_dict_value(sd, "stealthrock", 0) > 0
-            parts.append(self._presence_one_hot(bool(sr_present)))
-
-            # Spikes
-            spikes_key = getattr(SideCondition, "SPIKES", "spikes")
-            parts.append(spikes_onehot(self._get_dict_value(sd, spikes_key, 0)))
-
-            # Toxic Spikes
-            tsp_key = getattr(SideCondition, "TOXIC_SPIKES", "toxicspikes")
-            parts.append(tspikes_onehot(self._get_dict_value(sd, tsp_key, 0)))
-
-            # Reflect
-            ref_key = getattr(SideCondition, "REFLECT", "reflect")
-            parts.append(duration_onehot(self._get_dict_value(sd, ref_key, 0), 10))
-
-            # Light Screen
-            ls_key = getattr(SideCondition, "LIGHT_SCREEN", "lightscreen")
-            parts.append(duration_onehot(self._get_dict_value(sd, ls_key, 0), 10))
-
-            # Safeguard
-            sg_key = getattr(SideCondition, "SAFEGUARD", "safeguard")
-            parts.append(duration_onehot(self._get_dict_value(sd, sg_key, 0), 7))
-
-        return np.concatenate(parts)
-
-    # ---- Table A.2 per-Pokémon encoder (300 dims) ----
-
-    def _idx_or_zero(self, name: Optional[str], mapping: Dict[str, int], clip_max: Optional[int] = None) -> int:
-        if not name:
-            return 0
-        key = str(name).lower()
-        idx = mapping.get(key, 0)
-        if clip_max is not None:
-            idx = int(np.clip(idx, 0, clip_max))
-        return int(idx)
-
-    def _hp_fraction(self, mon) -> float:
-        try:
-            return float(getattr(mon, "current_hp_fraction", 0.0) or 0.0)
-        except Exception:
-            return 0.0
-
-    def _get_boost(self, mon, key: str) -> int:
-        try:
-            boosts = getattr(mon, "boosts", {}) or {}
-            # common aliases
-            if key not in boosts and key == "accuracy":
-                key = "acc"
-            return int(boosts.get(key, 0))
-        except Exception:
-            return 0
-
-    def _one_hot_boost(self, val: int) -> np.ndarray:
-        # onehot from -6..+6 (13 bins); clamp
-        v = int(np.clip(val, -6, 6))
-        return self._one_hot(v + 6, 13)
-
-    def _one_hot_duration_or_none(self, turns: int, length: int) -> np.ndarray:
-        # bins 0..(length-2) => turns 1..(length-1), bin (length-1) => none
-        if turns <= 0:
-            return self._one_hot(length - 1, length)
-        return self._one_hot(int(np.clip(turns - 1, 0, length - 2)), length)
-
-    def _pp_bin_value(self, move) -> float:
-        # Encode as {0, 0.25, 0.5, 0.75} using floor(cuberoot(pp-1))/4
-        try:
-            pp = int(getattr(move, "current_pp", 0) or 0)
-        except Exception:
-            pp = 0
-        b = int(np.floor(np.cbrt(max(pp - 1, 0))))
-        b = int(np.clip(b, 0, 3))
-        return float(b) / 4.0
-
-    def _last_used_move_index(self, mon) -> int:
-        # Try common attributes
-        for attr in ("last_move", "last_used_move", "last_used_move_name"):
-            mv = getattr(mon, attr, None)
-            if mv:
-                try:
-                    name = getattr(mv, "id", None) or getattr(mv, "name", None) or str(mv)
-                    return self._idx_or_zero(name, self._move_index, 198)
-                except Exception:
-                    pass
-        return 0
-
-    def _get_effects_dict(self, mon) -> Dict[str, Any]:
-        # Try a few attribute names that poke-env might use for volatile effects
-        for attr in ("effects", "volatile_statuses", "volatile", "volatiles", "statuses"):
-            eff = getattr(mon, attr, None)
-            if isinstance(eff, dict):
-                return eff
-            if isinstance(eff, set):
-                # convert set to dict of True
-                return {str(x).lower(): True for x in eff}
-        return {}
-
-    def _has_effect(self, effs: Dict[str, Any], name: str) -> bool:
-        if not effs:
-            return False
-        low = name.lower()
-        if low in effs:
-            return True
-        # some effects may be objects with .name or .id
-        for k, v in effs.items():
-            try:
-                if isinstance(k, str) and k.lower() == low:
-                    return True
-                nm = getattr(v, "name", None) or getattr(v, "id", None)
-                if nm and str(nm).lower() == low:
-                    return True
-            except Exception:
-                pass
-        return False
-
-    def _effect_turns(self, effs: Dict[str, Any], name: str) -> int:
-        # Try to extract a "turns" or "duration" int from the effect entry
-        if not effs:
-            return 0
-        low = name.lower()
-        entry = None
-        if low in effs:
-            entry = effs[low]
-        else:
-            for k, v in effs.items():
-                if isinstance(k, str) and k.lower() == low:
-                    entry = v
-                    break
-        if entry is None:
-            return 0
-        try:
-            for key in ("turns", "duration", "counter", "remaining"):
-                if hasattr(entry, key):
-                    return int(getattr(entry, key) or 0)
-                if isinstance(entry, dict) and key in entry:
-                    return int(entry[key] or 0)
-        except Exception:
-            pass
-        # some effects store remaining as the int itself
-        try:
-            return int(entry)
-        except Exception:
-            return 0
-
-    def _type_one_hot(self, mon) -> np.ndarray:
-        vec = np.zeros(18, dtype=np.float32)
-        try:
-            types = getattr(mon, "types", None)
-            if types:
-                for t in types:
-                    # t can be enum-like; use name or str
-                    name = (getattr(t, "name", None) or str(t)).lower()
-                    idx = self._type_to_idx.get(name, None)
-                    if idx is not None and 0 <= idx < 18:
-                        vec[idx] = 1.0
-        except Exception:
-            pass
-        return vec
-
-    def _gender_one_hot(self, mon) -> np.ndarray:
-        # male, female, neutral (3)
-        g = (getattr(mon, "gender", None) or "").lower()
-        if g.startswith("m"):
-            return np.array([1.0, 0.0, 0.0], dtype=np.float32)
-        if g.startswith("f"):
-            return np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        return np.array([0.0, 0.0, 1.0], dtype=np.float32)
-
-    def _status_one_hot(self, mon) -> np.ndarray:
-        # 7 bins: BRN, PAR, PSN, TOX, FRZ, SLP, FNT
-        order = ["brn", "par", "psn", "tox", "frz", "slp"]
-        vec = np.zeros(7, dtype=np.float32)
-        hp0 = self._hp_fraction(mon) <= 0.0
-        if hp0:
-            vec[6] = 1.0
-            return vec
-        st = getattr(mon, "status", None)
-        if st:
-            s = str(st).lower()
-            for i, name in enumerate(order):
-                if name in s:
-                    vec[i] = 1.0
-                    break
-        return vec
-
-    def _toxic_counter_one_hot(self, mon) -> np.ndarray:
-        # 21 bins for # turns (0..20)
-        turns = 0
-        try:
-            st = getattr(mon, "status", None)
-            if st and "tox" in str(st).lower():
-                turns = int(getattr(mon, "status_counter", 0) or 0)
-        except Exception:
-            turns = 0
-        turns = int(np.clip(turns, 0, 20))
-        return self._one_hot(turns, 21)
-
-    def _sleep_counter_one_hot(self, mon) -> np.ndarray:
-        # 11 bins for # turns (0..10)
-        turns = 0
-        try:
-            st = getattr(mon, "status", None)
-            if st and "slp" in str(st).lower():
-                turns = int(getattr(mon, "status_counter", 0) or 0)
-        except Exception:
-            turns = 0
-        turns = int(np.clip(turns, 0, 10))
-        return self._one_hot(turns, 11)
-
-    def _log10_one_hot(self, value: Optional[float], bins: int, clamp: Tuple[int, int]) -> np.ndarray:
-        # Round log10(value) and map to [clamp[0], clamp[1]] inclusive, then shift to 0..bins-1
-        vec = np.zeros(bins, dtype=np.float32)
-        if value is None or value <= 0:
-            vec[0] = 1.0
-            return vec
-        lg = int(np.round(np.log10(max(value, 1e-8))))
-        lg = int(np.clip(lg, clamp[0], clamp[1]))
-        idx = lg - clamp[0]  # shift to start at 0
-        idx = int(np.clip(idx, 0, bins - 1))
-        vec[idx] = 1.0
-        return vec
-
-    def _is_preparing(self, effs: Dict[str, Any]) -> bool:
-        for nm in ("fly", "bounce", "dig", "dive", "shadowforce", "phantomforce", "skydrop", "skyattack", "solarbeam", "solarblade", "geomancy"):
-            if self._has_effect(effs, nm):
-                return True
-        return False
-
-    def _pokemon_weight_height(self, species_name: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
-        if not species_name:
-            return None, None
-        key = str(species_name).lower()
-        # poke-env stores pokedex data under gen_data.pokedex, keys lowercase species names
-        try:
-            dex = getattr(self._gen_data, "pokedex", None) or {}
-            data = dex.get(key, None)
-            if isinstance(data, dict):
-                w = data.get("weight_kg", None)
-                h = data.get("height_m", None)
-                return (float(w) if w is not None else None, float(h) if h is not None else None)
-        except Exception:
-            pass
-        return None, None
-
-    def _encode_one_pokemon(self, mon, is_opponent: bool, is_active: bool) -> np.ndarray:
-        # Unknown slot sentinel: if None or no species known
-        if mon is None:
-            vec = np.zeros(300, dtype=np.float32)
-            vec[-1] = 1.0  # unknown bit
-            # mark is_opponent and active even if unknown (keeps slot identity)
-            vec[-3] = 1.0 if is_active else 0.0         # active onehot idx 1 at -3/-2 region
-            vec[-2] = 1.0 if is_opponent else 0.0       # is_opponent onehot idx 1 at -2/-1 region
-            return vec
-
-        species_name = getattr(mon, "species", None)
-        unknown = species_name is None or str(species_name).lower() in ("unknown", "unrevealed", "")
-
-        # Precompute effects
-        effs = self._get_effects_dict(mon)
-
-        # Scalars (clipped indices per table domains)
-        species_idx = self._idx_or_zero(species_name, self._species_index, 295)
-        ability_idx = self._idx_or_zero(getattr(mon, "ability", None), self._ability_index, 100)
-        item_idx = self._idx_or_zero(getattr(mon, "item", None), self._item_index, 39)
-
-        # Moves: 4 ids + 4 PP bin scalars
-        move_ids: List[int] = [0, 0, 0, 0]
-        move_pp_bins: List[float] = [0.0, 0.0, 0.0, 0.0]
-        try:
-            moves_list = list(getattr(mon, "moves", {}).values())
-        except Exception:
-            moves_list = []
-        for i in range(min(4, len(moves_list))):
-            mv = moves_list[i]
-            mv_name = getattr(mv, "id", None) or getattr(mv, "name", None)
-            move_ids[i] = self._idx_or_zero(mv_name, self._move_index, 198)
-            move_pp_bins[i] = self._pp_bin_value(mv)
-
-        last_move_idx = self._last_used_move_index(mon)
-
-        # Types
-        types_vec = self._type_one_hot(mon)
-
-        # HP fraction binning
-        hp_bin = self._bin_hp_fraction(self._hp_fraction(mon))
-
-        # Boosts
-        boosts = [
-            self._one_hot_boost(self._get_boost(mon, "accuracy")),
-            self._one_hot_boost(self._get_boost(mon, "atk")),
-            self._one_hot_boost(self._get_boost(mon, "def")),
-            self._one_hot_boost(self._get_boost(mon, "evasion")),
-            self._one_hot_boost(self._get_boost(mon, "spa")),
-            self._one_hot_boost(self._get_boost(mon, "spd")),
-            self._one_hot_boost(self._get_boost(mon, "spe")),
-        ]
-
-        # Volatile effects (38 effects × 2 onehot [OFF/ON])
-        vol_parts: List[np.ndarray] = []
-        for name in self._volatile_names:
-            on = self._has_effect(effs, name)
-            vol_parts.append(self._presence_one_hot(on))
-        vol_vec = np.concatenate(vol_parts)
-
-        # Encore, Taunt, Magnet Rise, Slow Start durations (or none)
-        encore_vec = self._one_hot_duration_or_none(self._effect_turns(effs, "encore"), 9)
-        taunt_vec = self._one_hot_duration_or_none(self._effect_turns(effs, "taunt"), 6)
-        mrise_vec = self._one_hot_duration_or_none(self._effect_turns(effs, "magnet rise"), 7)
-        sslow_vec = self._one_hot_duration_or_none(self._effect_turns(effs, "slowstart"), 6)
-
-        # Gender (3)
-        gender_vec = self._gender_one_hot(mon)
-
-        # Status (7), Toxic and Sleep counters
-        status_vec = self._status_one_hot(mon)
-        tox_vec = self._toxic_counter_one_hot(mon)
-        slp_vec = self._sleep_counter_one_hot(mon)
-
-        # Weight and Height onehots: log10(weight) => 5 bins (clamp [-2..2]), log10(height) => 4 bins (clamp [-1..2])
-        w_kg, h_m = self._pokemon_weight_height(species_name if not unknown else None)
-        weight_vec = self._log10_one_hot(w_kg, bins=5, clamp=(-2, 2))
-        height_vec = self._log10_one_hot(h_m, bins=4, clamp=(-1, 2))
-
-        # First turn, Protect counter, Must recharge, Preparing, Active, Is opponent
-        first_turn = False
-        if hasattr(mon, "just_switched"):
-            first_turn = bool(getattr(mon, "just_switched"))
-        elif hasattr(mon, "first_turn"):
-            first_turn = bool(getattr(mon, "first_turn"))
-        first_turn_vec = self._presence_one_hot(first_turn)
-
-        # Protect counter (0..5) -> 6 onehot (no "none" separate)
-        prot_count = 0
-        for nm in ("protectcounter", "protect_counter", "protects_in_row", "consecutive_protects"):
-            if hasattr(mon, nm):
-                try:
-                    prot_count = int(getattr(mon, nm) or 0)
-                    break
-                except Exception:
-                    pass
-        prot_count = int(np.clip(prot_count, 0, 5))
-        protect_vec = self._one_hot(prot_count, 6)
-
-        # Must recharge: volatile or boolean attribute
-        must_recharge = self._has_effect(effs, "mustrecharge") or bool(getattr(mon, "must_recharge", False))
-        must_recharge_vec = self._presence_one_hot(must_recharge)
-
-        # Preparing two-turn moves
-        preparing = self._is_preparing(effs)
-        preparing_vec = self._presence_one_hot(preparing)
-
-        active_vec = self._presence_one_hot(is_active)
-        opp_vec = self._presence_one_hot(is_opponent)
-
-        # Unknown flag: if true, zero all others and set unknown bit
-        if unknown:
-            vec = np.zeros(300, dtype=np.float32)
-            # keep active/opponent flags even if unknown
-            vec[-3] = 1.0 if is_active else 0.0
-            vec[-2] = 1.0 if is_opponent else 0.0
-            vec[-1] = 1.0
-            return vec
-
-        # Assemble vector in the exact Table A.2 order (length sums to 300)
-        parts: List[np.ndarray] = []
-        parts.append(np.array([float(species_idx)], dtype=np.float32))  # species (1)
-        parts.append(np.array([float(ability_idx)], dtype=np.float32))  # ability (1)
-        parts.append(np.array([float(item_idx)], dtype=np.float32))     # item (1)
-        parts.append(np.array([float(x) for x in move_ids], dtype=np.float32))  # move (4)
-        parts.append(np.array([float(x) for x in move_pp_bins], dtype=np.float32))  # ⌊∛PP⌋/4 (4)
-        parts.append(np.array([float(last_move_idx)], dtype=np.float32))  # last used move (1)
-        parts.append(types_vec.astype(np.float32))  # types (18)
-        parts.append(hp_bin.astype(np.float32))     # current hp fraction (7)
-        # boosts
-        parts.append(boosts[0])  # accuracy (13)
-        parts.append(boosts[1])  # atk (13)
-        parts.append(boosts[2])  # def (13)
-        parts.append(boosts[3])  # evasion (13)
-        parts.append(boosts[4])  # spa (13)
-        parts.append(boosts[5])  # spd (13)
-        parts.append(boosts[6])  # spe (13)
-        # volatile effects 2*38 (76)
-        parts.append(vol_vec.astype(np.float32))
-        # durations
-        parts.append(encore_vec.astype(np.float32))  # 9
-        parts.append(taunt_vec.astype(np.float32))   # 6
-        parts.append(mrise_vec.astype(np.float32))   # 7
-        parts.append(sslow_vec.astype(np.float32))   # 6
-        # misc
-        parts.append(gender_vec.astype(np.float32))  # 3
-        parts.append(status_vec.astype(np.float32))  # 7
-        parts.append(tox_vec.astype(np.float32))     # 21
-        parts.append(slp_vec.astype(np.float32))     # 11
-        parts.append(weight_vec.astype(np.float32))  # 5
-        parts.append(height_vec.astype(np.float32))  # 4
-        parts.append(first_turn_vec.astype(np.float32))  # 2
-        parts.append(protect_vec.astype(np.float32))     # 6
-        parts.append(must_recharge_vec.astype(np.float32))  # 2
-        parts.append(preparing_vec.astype(np.float32))      # 2
-        parts.append(active_vec.astype(np.float32))         # 2
-        parts.append(opp_vec.astype(np.float32))            # 2
-        # unknown (1)
-        parts.append(np.array([0.0], dtype=np.float32))
-
-        vec = np.concatenate(parts).astype(np.float32)
-        if vec.shape[0] != 300:
-            raise RuntimeError(f"Per-Pokémon vector size mismatch: {vec.shape[0]} != 300")
-        return vec
-
-    def _ordered_team(self, battle: AbstractBattle) -> Tuple[List[Any], List[Any]]:
-        # Ensure 6 slots for each side; place active first, then others, pad with None as unknowns
-        ours: List[Any] = []
-        opps: List[Any] = []
-        active = getattr(battle, "active_pokemon", None)
-        if active:
-            ours.append(active)
-        ours_rest = [m for m in getattr(battle, "team", {}).values() if m is not active]
-        ours.extend(ours_rest)
-        ours = (ours + [None] * 6)[:6]
-
-        opp_active = getattr(battle, "opponent_active_pokemon", None)
-        if opp_active:
-            opps.append(opp_active)
-        opps_rest = [m for m in getattr(battle, "opponent_team", {}).values() if m is not opp_active]
-        opps.extend(opps_rest)
-        opps = (opps + [None] * 6)[:6]
-
-        return ours, opps
-
-    def _encode_pokemon_block(self, battle: AbstractBattle) -> np.ndarray:
-        ours, opps = self._ordered_team(battle)
-        vecs: List[np.ndarray] = []
-        for i, mon in enumerate(ours):
-            vecs.append(self._encode_one_pokemon(mon, is_opponent=False, is_active=(i == 0)))
-        for i, mon in enumerate(opps):
-            vecs.append(self._encode_one_pokemon(mon, is_opponent=True, is_active=(i == 0)))
-        block = np.concatenate(vecs).astype(np.float32)
-        if block.shape[0] != 12 * 300:
-            raise RuntimeError(f"Pokémon block size mismatch: {block.shape[0]} != {12*300}")
-        return block
+        """
+        Returns the size of the observation size to create the observation space for all possible agents in the environment.
+
+        The observation includes:
+        - 6 features: our team health fractions
+        - 6 features: opponent team health fractions
+        - 8 strategic features: speed advantage, type effectiveness, resistance, move power,
+          status conditions, and team sizes
+        Total: 6 + 6 + 8 = 20 features
+
+        Returns:
+            int: The size of the observation space (20).
+        """
+
+        return 20
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
-        3725-dim vector per Appendix A:
-        - Weather (9*4 + 1 = 37)
-        - Trick Room (7)
-        - Force Switch (2)
-        - Unknown (7)  [reserved extra effects block]
-        - Hazards & Screens (SR 2*2, Spikes 2*4, TSpikes 2*3, Reflect 2*10, Light Screen 2*10, Safeguard 2*7) = 72
-        - Pokémon: 12 * 300 = 3600
-        Total = 37 + 7 + 2 + 7 + 72 + 3600 = 3725
-        """
-        weather = self._encode_weather_block(battle)       # 37
-        trick = self._encode_trick_room(battle)            # 7
-        forced = self._encode_force_switch(battle)         # 2
-        unknown = np.zeros(7, dtype=np.float32)            # placeholder per Table A.1
-        hazards = self._encode_hazards_and_screens(battle) # 72
-        pokes = self._encode_pokemon_block(battle)         # 3600
+        Embeds the current state of a Pokémon battle into a numerical vector representation.
 
-        final_vec = np.concatenate([weather, trick, forced, unknown, hazards, pokes]).astype(np.float32)
-        if final_vec.shape[0] != self._observation_size():
-            raise RuntimeError(f"Observation size mismatch: got {final_vec.shape[0]}, expected {self._observation_size()}")
-        return final_vec
+        This embedding provides strategic information to help beat max damage bots:
+        - Health information for decision making
+        - Type effectiveness for resistance/advantage
+        - Speed comparison for turn order decisions
+        - Active Pokemon information for switching decisions
+
+        Args:
+            battle (AbstractBattle): The current battle instance containing information about
+                the player's team and the opponent's team.
+        Returns:
+            np.float32: A 1D numpy array containing the strategic battle state features.
+        """
+
+        type_chart = GenData.from_gen(9).type_chart
+
+        # Basic health information
+        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
+        health_opponent = [
+            mon.current_hp_fraction for mon in battle.opponent_team.values()
+        ]
+
+        # Pad health arrays to ensure consistent size (assuming max 6 Pokemon)
+        health_team.extend([0.0] * (6 - len(health_team)))
+        health_opponent.extend([0.0] * (6 - len(health_opponent)))
+
+        # Active Pokemon information
+        active_mon = battle.active_pokemon
+        opp_active_mon = battle.opponent_active_pokemon
+
+        # Speed comparison (normalized) - helps with switching decisions
+        speed_advantage = 0.0
+        if active_mon and opp_active_mon and opp_active_mon.stats.get("spe"):
+            our_speed = active_mon.stats.get("spe", 100)
+            opp_speed = opp_active_mon.stats.get("spe", 100)
+            # Normalize speed difference to [-1, 1] range
+            speed_advantage = min(max((our_speed - opp_speed) / 200.0, -1.0), 1.0)
+
+        # Type effectiveness of our active Pokemon against opponent
+        type_advantage = 0.0
+        if active_mon and opp_active_mon:
+            # Calculate average type effectiveness of our types against opponent
+            our_types = active_mon.types
+            opp_types = opp_active_mon.types
+            if our_types and opp_types:
+                effectiveness_values = []
+                for our_type in our_types:
+                    for opp_type in opp_types:
+                        # This is a simplified type effectiveness calculation
+                        # In a real implementation, you'd want to use the actual type chart
+                        effectiveness = our_type.damage_multiplier(
+                            opp_type, type_chart=type_chart
+                        )
+                        effectiveness_values.append(effectiveness)
+                if effectiveness_values:
+                    # Convert to log scale and normalize: 0.25->-1, 0.5->-0.5, 1->0, 2->0.5, 4->1
+                    avg_effectiveness = np.mean(effectiveness_values)
+                    type_advantage = (
+                        min(max(np.log2(avg_effectiveness), -2.0), 2.0) / 2.0
+                    )
+
+        # Type resistance (how well we resist opponent's attacks)
+        type_resistance = 0.0
+        if active_mon and opp_active_mon:
+            # Calculate how resistant we are to opponent's types
+            resistance_values = []
+            for opp_type in opp_active_mon.types:
+                for our_type in active_mon.types:
+                    resistance = opp_type.damage_multiplier(
+                        our_type, type_chart=type_chart
+                    )
+                    resistance_values.append(resistance)
+            if resistance_values:
+                avg_resistance = np.mean(resistance_values)
+                # Invert and normalize: 4x damage taken -> -1, 2x -> -0.5, 1x -> 0, 0.5x -> 0.5, 0.25x -> 1
+                type_resistance = min(max(-np.log2(avg_resistance), -2.0), 2.0) / 2.0
+
+        # Available moves power (normalized average)
+        avg_move_power = 0.0
+        if active_mon and active_mon.moves:
+            move_powers = []
+            for move in active_mon.moves.values():
+                if move.base_power:
+                    move_powers.append(move.base_power)
+            if move_powers:
+                avg_move_power = min(
+                    np.mean(move_powers) / 120.0, 1.0
+                )  # Normalize to [0,1]
+
+        # Status condition indicators
+        our_status = 0.0
+        opp_status = 0.0
+        if active_mon:
+            our_status = 1.0 if active_mon.status else 0.0
+        if opp_active_mon:
+            opp_status = 1.0 if opp_active_mon.status else 0.0
+
+        # Team size remaining (normalized)
+        team_alive = sum(1 for hp in health_team if hp > 0) / 6.0
+        opp_alive = sum(1 for hp in health_opponent if hp > 0) / 6.0
+
+        # Combine all features
+        strategic_features = [
+            speed_advantage,  # -1 to 1: negative means opponent is faster
+            type_advantage,  # -1 to 1: positive means our attacks are effective
+            type_resistance,  # -1 to 1: positive means we resist their attacks
+            avg_move_power,  # 0 to 1: normalized average move power
+            our_status,  # 0 or 1: whether we have status condition
+            opp_status,  # 0 or 1: whether opponent has status condition
+            team_alive,  # 0 to 1: fraction of our team alive
+            opp_alive,  # 0 to 1: fraction of opponent team alive
+        ]
+
+        # Final vector combines health info and strategic features
+        final_vector = np.concatenate(
+            [
+                health_team,  # 6 features: our team health
+                health_opponent,  # 6 features: opponent team health
+                strategic_features,  # 8 features: strategic information
+            ]
+        )
+
+        return np.array(final_vector, dtype=np.float32)
 
 
 ########################################

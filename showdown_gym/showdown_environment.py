@@ -27,8 +27,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         account_name_two: str = "train_two",
         team: str | None = None,
     ):
-        self.allowed_actions = list(range(-2, 10)) + list(range(22, 26))
-        
+        self._last_action: int | None = None
         super().__init__(
             battle_format=battle_format,
             account_name_one=account_name_one,
@@ -46,7 +45,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         This should return the number of actions you wish to use if not using the default action scheme.
         """
-        return len(self.allowed_actions)  # Return None if action size is default
+        return 10
 
     def process_action(self, action: np.int64) -> np.int64:
         """
@@ -68,10 +67,12 @@ class ShowdownEnvironment(BaseShowdownEnv):
         :return: The battle order ID for the given action in context of the current battle.
         :rtype: np.Int64
         """
-        idx = int(action)
-        if idx < 0 or idx >= len(self.allowed_actions):
-            raise ValueError(f"Invalid action index: {idx}")
-        return np.int64(self.allowed_actions[idx])
+        try:
+            self._last_action = int(action)
+        except Exception:
+            self._last_action = None
+        
+        return action
 
     def get_additional_info(self) -> Dict[str, Dict[str, Any]]:
         info = super().get_additional_info()
@@ -85,234 +86,278 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         return info
 
+    def hint_action(self, battle: AbstractBattle):
+        """
+        Uses a simple heuristic to suggest an action for the agent.
+        - Calculate most effective move of current pokemon using base_power * type_effectiveness * stab * weather_mult * terrain_mult * accuracy_mult
+        - Check if there is a better switch if effectiveness of current move is < 1
+        - Switch if there is a better option, e.g. effectiveness > 1
+        - If an index in the output array is 1, that action is suggested.
+        - Else if index is 0, that action is not suggested.
+        - First 6 indices are switches, next 4 incides are moves (6 possible switches, 4 moves max, maps nicely to action space)
+        """
+        type_chart = GenData.from_gen(9).type_chart
+
+        output = np.zeros(self._get_action_size(), dtype=np.int8)
+        
+        # Get current pokemon and opponent
+        me = battle.active_pokemon
+        opp = battle.opponent_active_pokemon
+        
+        if me is None or opp is None:
+            return output
+        
+        my_types = me.types
+        opp_types = opp.types
+        
+        # Helper function to calculate type effectiveness
+        def calc_effectiveness(move_type, defender_types):
+            """Calculate type effectiveness multiplier"""
+            if move_type is None:
+                return 1.0
+            # Convert move_type to string key
+            if hasattr(move_type, 'name'):
+                move_type_str = move_type.name.lower()
+            else:
+                move_type_str = str(move_type).lower()
+            multiplier = 1.0
+            for def_type in defender_types:
+                if def_type is not None:
+                    if hasattr(def_type, 'name'):
+                        def_type_str = def_type.name.lower()
+                    else:
+                        def_type_str = str(def_type).lower()
+                    try:
+                        effectiveness = type_chart[move_type_str][def_type_str]
+                    except KeyError:
+                        # fallback: try stripping extra info or use 1.0
+                        effectiveness = 1.0
+                    multiplier *= effectiveness
+            return multiplier
+        
+        # Helper function to check move immunity due to ability
+        def is_immune_ability(move_type, ability):
+            """Check if move is immune due to opponent's ability"""
+            if not ability:
+                return False
+            ability_name = str(ability).lower()
+            immunity_map = {
+                "levitate": "ground",
+                "flashfire": "fire",
+                "waterabsorb": "water",
+                "dryskin": "water",
+                "sapsipper": "grass",
+                "lightningrod": "electric",
+                "stormdrain": "water",
+                "voltabsorb": "electric",
+            }
+            if hasattr(move_type, 'name'):
+                move_type_name = move_type.name.lower()
+            else:
+                move_type_name = str(move_type).lower() or ""
+            return immunity_map.get(ability_name) == move_type_name
+        
+        # Calculate weather and terrain boosts
+        weather_boost_map = {}
+        terrain_boost_map = {}
+        
+        # Check for weather effects
+        if hasattr(battle, "weather"):
+            weather = battle.weather
+            if weather:
+                weather_name = str(weather).lower()
+                if "sunnyday" in weather_name or "sun" in weather_name:
+                    weather_boost_map["fire"] = 1.5
+                    weather_boost_map["water"] = 0.5
+                elif "raindance" in weather_name or "rain" in weather_name:
+                    weather_boost_map["water"] = 1.5
+                    weather_boost_map["fire"] = 0.5
+        
+        # Check for terrain effects
+        if hasattr(battle, "fields"):
+            for field in battle.fields:
+                field_name = str(field).lower()
+                if "electricterrain" in field_name:
+                    terrain_boost_map["electric"] = 1.3
+                elif "grassyterrain" in field_name:
+                    terrain_boost_map["grass"] = 1.3
+                elif "psychicterrain" in field_name:
+                    terrain_boost_map["psychic"] = 1.3
+                elif "mistyterrain" in field_name:
+                    terrain_boost_map["dragon"] = 0.5
+        
+        # Evaluate available moves
+        best_move_idx = None
+        best_move_score = -1.0
+        best_move_effectiveness = 0.0
+        
+        for i, move in enumerate(battle.available_moves):
+            if i >= 4:  # Only consider first 4 moves
+                break
+            
+            move_type = move.type
+            base_power = move.base_power if move.base_power else 0
+            
+            if base_power <= 0:
+                continue
+            
+            # Check ability immunity
+            opp_ability = opp.ability if hasattr(opp, 'ability') else None
+            if is_immune_ability(move_type, opp_ability):
+                continue
+            
+            # Calculate type effectiveness
+            type_effectiveness = calc_effectiveness(move_type, opp_types)
+            
+            if type_effectiveness == 0.0:
+                continue
+            
+            # STAB bonus
+            stab = 1.5 if move_type in my_types else 1.0
+            
+            # Weather boost
+            if hasattr(move_type, 'name'):
+                move_type_name = move_type.name.lower()
+            else:
+                move_type_name = str(move_type).lower() or ""
+            weather_mult = weather_boost_map.get(move_type_name, 1.0)
+            
+            # Terrain boost
+            terrain_mult = terrain_boost_map.get(move_type_name, 1.0)
+            
+            # Accuracy factor
+            accuracy = move.accuracy if hasattr(move, 'accuracy') and move.accuracy else 100
+            accuracy_mult = accuracy / 100.0 if accuracy else 1.0
+            
+            # Calculate total score
+            total_score = base_power * type_effectiveness * stab * weather_mult * terrain_mult * accuracy_mult
+            
+            if total_score > best_move_score:
+                best_move_score = total_score
+                best_move_idx = i
+                best_move_effectiveness = type_effectiveness
+        
+        # Evaluate potential switches
+        best_switch_idx = None
+        best_switch_score = -1.0
+        
+        team_list = list(battle.team.values())
+        for i, mon in enumerate(team_list):
+            if i >= 6:  # Only consider first 6 pokemon
+                break
+            
+            # Skip if this is the active pokemon or if fainted
+            if mon == me or mon.fainted or mon not in battle.available_switches:
+                continue
+            
+            switch_types = mon.types
+            
+            # Calculate offensive advantage (how well switch-in hits opponent)
+            offensive_advantage = 0.0
+            for switch_type in switch_types:
+                if switch_type is not None:
+                    eff = calc_effectiveness(switch_type, opp_types)
+                    offensive_advantage = max(offensive_advantage, eff)
+            
+            # Calculate defensive risk (how well opponent hits switch-in)
+            defensive_risk = 1.0
+            for opp_type in opp_types:
+                if opp_type is not None:
+                    eff = calc_effectiveness(opp_type, switch_types)
+                    defensive_risk = max(defensive_risk, eff)
+            
+            # Score: prioritize offensive advantage and minimize defensive risk
+            switch_score = (offensive_advantage * 2.0) / (defensive_risk + 0.5)
+            
+            if switch_score > best_switch_score:
+                best_switch_score = switch_score
+                best_switch_idx = i
+        
+        # Decision logic: switch if current move is not effective and we have a better switch
+        if best_move_effectiveness < 1.0 and best_switch_idx is not None and best_switch_score > 1.5:
+            # Suggest the best switch
+            output[best_switch_idx] = 1
+        elif best_move_idx is not None:
+            # Suggest the best move (indices 6-9 for moves)
+            output[6 + best_move_idx] = 1
+        elif best_switch_idx is not None:
+            # If no good moves, suggest best switch
+            output[best_switch_idx] = 1
+        else:
+            # Fallback: suggest first available action
+            if battle.available_moves:
+                output[6] = 1
+            elif battle.available_switches:
+                output[0] = 1
+        
+        return output
+
     def calc_reward(self, battle: AbstractBattle) -> float:
         """
         Calculates the reward based on the changes in state of the battle.
 
-        This reward function is designed to beat max damage bots by incentivizing:
-        1. Dealing damage while minimizing damage taken
-        2. Winning battles with large bonuses
-        3. Keeping Pokemon alive for strategic advantage
-        4. Making progress toward victory
+        Pure hint imitation reward:
+        +1.0 if the chosen action equals the hint computed on the PRIOR state
+        +0.0 otherwise
 
         Args:
             battle (AbstractBattle): The current battle instance containing information
                 about the player's team and the opponent's team from the player's perspective.
         Returns:
-            float: The calculated reward based on the change in state of the battle.
+            float: The calculated reward based on hint alignment.
         """
+        try:
+            prior_battle = self._get_prior_battle(battle)
+        except AttributeError:
+            prior_battle = None
 
-        prior_battle = self._get_prior_battle(battle)
-        reward = 0.0
-
-        # Battle outcome rewards (highest priority)
-        if battle.battle_tag and battle.finished:
-            if battle.won:
-                reward += 25  # Large reward for winning
-            else:
-                reward -= 20  # Penalty for losing
-            return reward
-
-        # Only calculate incremental rewards if we have a prior state
         if prior_battle is None:
             return 0.0
 
-        # Get current and prior health states
-        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
+        # Get hint action from prior state
+        previous_hint = self.hint_action(prior_battle)
+        hinted_idx = int(np.argmax(previous_hint)) if previous_hint.sum() > 0 else None
 
-        prior_health_team = [
-            mon.current_hp_fraction for mon in prior_battle.team.values()
-        ]
-        prior_health_opponent = [
-            mon.current_hp_fraction for mon in prior_battle.opponent_team.values()
-        ]
+        # Reward if agent followed the hint
+        if hinted_idx is not None and hasattr(self, '_last_action') and self._last_action is not None:
+            return 1.0 if int(self._last_action) == hinted_idx else 0.0
 
-        # Ensure consistent array lengths (pad with 1.0 for missing Pokemon)
-        max_team_size = max(len(health_team), len(prior_health_team))
-        health_team.extend([1.0] * (max_team_size - len(health_team)))
-        prior_health_team.extend([1.0] * (max_team_size - len(prior_health_team)))
-
-        max_opp_size = max(len(health_opponent), len(prior_health_opponent))
-        health_opponent.extend([1.0] * (max_opp_size - len(health_opponent)))
-        prior_health_opponent.extend(
-            [1.0] * (max_opp_size - len(prior_health_opponent))
-        )
-
-        # Calculate health changes
-        team_damage_taken = np.sum(np.array(prior_health_team) - np.array(health_team))
-        opponent_damage_dealt = np.sum(
-            np.array(prior_health_opponent) - np.array(health_opponent)
-        )
-
-        # Reward damage dealt to opponent (positive)
-        reward += opponent_damage_dealt * 2.0
-
-        # Penalty for damage taken (negative, but smaller magnitude to encourage aggression)
-        reward -= team_damage_taken * 1.0
-
-        # Bonus for favorable damage trades (dealt more than received)
-        if opponent_damage_dealt > team_damage_taken:
-            reward += (opponent_damage_dealt - team_damage_taken) * 0.5
-
-        # Count Pokemon fainted (KO bonuses/penalties)
-        team_fainted = sum(1 for hp in health_team if hp == 0) - sum(
-            1 for hp in prior_health_team if hp == 0
-        )
-        opp_fainted = sum(1 for hp in health_opponent if hp == 0) - sum(
-            1 for hp in prior_health_opponent if hp == 0
-        )
-
-        reward += opp_fainted * 3.0  # Large bonus for KO'ing opponent Pokemon
-        reward -= team_fainted * 2.0  # Penalty for losing Pokemon
-
-        return reward
+        return 0.0
 
     def _observation_size(self) -> int:
         """
         Returns the size of the observation size to create the observation space for all possible agents in the environment.
 
-        The observation includes:
-        - 6 features: our team health fractions
-        - 6 features: opponent team health fractions
-        - 8 strategic features: speed advantage, type effectiveness, resistance, move power,
-          status conditions, and team sizes
-        Total: 6 + 6 + 8 = 20 features
+        You need to set obvervation size to the number of features you want to include in the observation.
+        Annoyingly, you need to set this manually based on the features you want to include in the observation from emded_battle.
 
         Returns:
-            int: The size of the observation space (20).
+            int: The size of the observation space.
         """
 
-        return 20
+        return 10
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
         Embeds the current state of a Pokémon battle into a numerical vector representation.
+        This method generates a feature vector that represents the current state of the battle,
+        this is used by the agent to make decisions.
 
-        This embedding provides strategic information to help beat max damage bots:
-        - Health information for decision making
-        - Type effectiveness for resistance/advantage
-        - Speed comparison for turn order decisions
-        - Active Pokemon information for switching decisions
+        Returns a one-hot encoded hint action array where exactly one index is 1:
+        - Indices 0-5: switch to pokemon 0-5
+        - Indices 6-9: use move 0-3
 
         Args:
             battle (AbstractBattle): The current battle instance containing information about
                 the player's team and the opponent's team.
         Returns:
-            np.float32: A 1D numpy array containing the strategic battle state features.
+            np.float32: A 1D numpy array containing the hint action one-hot vector (length 10).
         """
-
-        type_chart = GenData.from_gen(9).type_chart
-
-        # Basic health information
-        health_team = [mon.current_hp_fraction for mon in battle.team.values()]
-        health_opponent = [
-            mon.current_hp_fraction for mon in battle.opponent_team.values()
-        ]
-
-        # Pad health arrays to ensure consistent size (assuming max 6 Pokemon)
-        health_team.extend([0.0] * (6 - len(health_team)))
-        health_opponent.extend([0.0] * (6 - len(health_opponent)))
-
-        # Active Pokemon information
-        active_mon = battle.active_pokemon
-        opp_active_mon = battle.opponent_active_pokemon
-
-        # Speed comparison (normalized) - helps with switching decisions
-        speed_advantage = 0.0
-        if active_mon and opp_active_mon and opp_active_mon.stats.get("spe"):
-            our_speed = active_mon.stats.get("spe", 100)
-            opp_speed = opp_active_mon.stats.get("spe", 100)
-            # Normalize speed difference to [-1, 1] range
-            speed_advantage = min(max((our_speed - opp_speed) / 200.0, -1.0), 1.0)
-
-        # Type effectiveness of our active Pokemon against opponent
-        type_advantage = 0.0
-        if active_mon and opp_active_mon:
-            # Calculate average type effectiveness of our types against opponent
-            our_types = active_mon.types
-            opp_types = opp_active_mon.types
-            if our_types and opp_types:
-                effectiveness_values = []
-                for our_type in our_types:
-                    for opp_type in opp_types:
-                        # This is a simplified type effectiveness calculation
-                        # In a real implementation, you'd want to use the actual type chart
-                        effectiveness = our_type.damage_multiplier(
-                            opp_type, type_chart=type_chart
-                        )
-                        effectiveness_values.append(effectiveness)
-                if effectiveness_values:
-                    # Convert to log scale and normalize: 0.25->-1, 0.5->-0.5, 1->0, 2->0.5, 4->1
-                    avg_effectiveness = np.mean(effectiveness_values)
-                    type_advantage = (
-                        min(max(np.log2(avg_effectiveness), -2.0), 2.0) / 2.0
-                    )
-
-        # Type resistance (how well we resist opponent's attacks)
-        type_resistance = 0.0
-        if active_mon and opp_active_mon:
-            # Calculate how resistant we are to opponent's types
-            resistance_values = []
-            for opp_type in opp_active_mon.types:
-                for our_type in active_mon.types:
-                    resistance = opp_type.damage_multiplier(
-                        our_type, type_chart=type_chart
-                    )
-                    resistance_values.append(resistance)
-            if resistance_values:
-                avg_resistance = np.mean(resistance_values)
-                # Invert and normalize: 4x damage taken -> -1, 2x -> -0.5, 1x -> 0, 0.5x -> 0.5, 0.25x -> 1
-                type_resistance = min(max(-np.log2(avg_resistance), -2.0), 2.0) / 2.0
-
-        # Available moves power (normalized average)
-        avg_move_power = 0.0
-        if active_mon and active_mon.moves:
-            move_powers = []
-            for move in active_mon.moves.values():
-                if move.base_power:
-                    move_powers.append(move.base_power)
-            if move_powers:
-                avg_move_power = min(
-                    np.mean(move_powers) / 120.0, 1.0
-                )  # Normalize to [0,1]
-
-        # Status condition indicators
-        our_status = 0.0
-        opp_status = 0.0
-        if active_mon:
-            our_status = 1.0 if active_mon.status else 0.0
-        if opp_active_mon:
-            opp_status = 1.0 if opp_active_mon.status else 0.0
-
-        # Team size remaining (normalized)
-        team_alive = sum(1 for hp in health_team if hp > 0) / 6.0
-        opp_alive = sum(1 for hp in health_opponent if hp > 0) / 6.0
-
-        # Combine all features
-        strategic_features = [
-            speed_advantage,  # -1 to 1: negative means opponent is faster
-            type_advantage,  # -1 to 1: positive means our attacks are effective
-            type_resistance,  # -1 to 1: positive means we resist their attacks
-            avg_move_power,  # 0 to 1: normalized average move power
-            our_status,  # 0 or 1: whether we have status condition
-            opp_status,  # 0 or 1: whether opponent has status condition
-            team_alive,  # 0 to 1: fraction of our team alive
-            opp_alive,  # 0 to 1: fraction of opponent team alive
-        ]
-
-        # Final vector combines health info and strategic features
-        final_vector = np.concatenate(
-            [
-                health_team,  # 6 features: our team health
-                health_opponent,  # 6 features: opponent team health
-                strategic_features,  # 8 features: strategic information
-            ]
-        )
-
-        return np.array(final_vector, dtype=np.float32)
+        
+        # Get hint action one-hot vector (10 values: 0-5 for switches, 6-9 for moves)
+        hint = self.hint_action(battle).astype(np.float32)
+        
+        return hint
 
 
 ########################################
