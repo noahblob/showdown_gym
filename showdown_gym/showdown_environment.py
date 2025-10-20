@@ -306,6 +306,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
         Returns:
             float: The calculated reward based on hint alignment.
         """
+        if battle.finished:
+            return 10.0 if battle.won else -5.0
+
         try:
             prior_battle = self._get_prior_battle(battle)
         except AttributeError:
