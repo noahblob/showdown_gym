@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 from poke_env import (
@@ -9,19 +9,15 @@ from poke_env import (
     RandomPlayer,
     SimpleHeuristicsPlayer,
 )
-from poke_env.battle import AbstractBattle
+from poke_env.battle.move_category import MoveCategory
+from poke_env.battle.pokemon import Pokemon
+from poke_env.battle.side_condition import SideCondition
+from poke_env.battle.abstract_battle import AbstractBattle
 from poke_env.environment.single_agent_wrapper import SingleAgentWrapper
 from poke_env.player.player import Player
 from poke_env.data import GenData
 
 from showdown_gym.base_environment import BaseShowdownEnv
-
-def is_alive(mon) -> bool:
-    return bool(
-        mon
-        and not getattr(mon, "fainted", False)
-        and (getattr(mon, "current_hp", 0) > 0)
-    )
 
 def safe_accuracy(mv) -> float:
     acc = None
@@ -41,102 +37,147 @@ def safe_accuracy(mv) -> float:
     except Exception:
         return 1.0
 
-def best_type_effectiveness(attacker_types, defender) -> float:
-    if not attacker_types or not defender:
-        return 1.0
-    best = 0.0
-    for atk_type in attacker_types:
-        eff = defender.damage_multiplier(atk_type)
-        best = max(best, eff)
-    return best
-
 def hint_action(battle: AbstractBattle) -> np.ndarray:
     onehot = np.zeros(10, dtype=np.float32)
 
-    me = getattr(battle, "active_pokemon", None)
-    opp = getattr(battle, "opponent_active_pokemon", None)
-    my_types = getattr(me, "types", []) if me else []
-    opp_types = getattr(opp, "types", []) if opp else []
+    active: Optional[Pokemon] = getattr(battle, "active_pokemon", None)
+    opponent: Optional[Pokemon] = getattr(battle, "opponent_active_pokemon", None)
+    if active is None or opponent is None:
+        return onehot
 
-    team_list = list(battle.team.values())[:6]
-    valid_switch_idxs = []
-    for i, mon in enumerate(team_list):
-        if mon is None or mon is me:
-            continue
-        if is_alive(mon):
-            valid_switch_idxs.append(i)
+    # === Heuristic constants (adapted from SimpleHeuristicsPlayer) ===
+    ENTRY_HAZARDS = {
+        "spikes": SideCondition.SPIKES,
+        # Note: Fixing typo to actually match move.id "stealthrock"
+        "stealthrock": SideCondition.STEALTH_ROCK,
+        "stickyweb": SideCondition.STICKY_WEB,
+        "toxicspikes": SideCondition.TOXIC_SPIKES,
+    }
+    ANTI_HAZARDS_MOVES = {"rapidspin", "defog"}
+    SPEED_TIER_COEFICIENT = 0.1
+    HP_FRACTION_COEFICIENT = 0.4
+    SWITCH_OUT_MATCHUP_THRESHOLD = -2
 
-    avail_moves = (getattr(battle, "available_moves", []) or [])[:4]
-    valid_moves = []
-    for mi, mv in enumerate(avail_moves):
-        if not bool(getattr(mv, "disabled", False)):
-            valid_moves.append((6 + mi, mv))
-
-    stay_best_a, stay_best_score, stay_best_eff = None, -1.0, 1.0
-    for a, mv in valid_moves:
-        bp = float(getattr(mv, "base_power", 0.0) or 0.0)
-        mtyp = getattr(mv, "type", None)
-        
-        if not opp or not mtyp:
-            eff = 1.0
+    def _stat_estimation(mon: Pokemon, stat: str) -> float:
+        # Stat boosts value
+        if mon.boosts[stat] > 1:
+            boost = (2 + mon.boosts[stat]) / 2
         else:
-            eff = opp.damage_multiplier(mtyp)
-        
-        if eff == 0.0:
-            continue
-        
-        stab = 1.5 if (mtyp and any(mtyp == t for t in (my_types or []))) else 1.0
-        acc = safe_accuracy(mv)
-        score = bp * eff * stab * acc
-        
-        if score > stay_best_score:
-            stay_best_score = score
-            stay_best_a = a
-            stay_best_eff = eff
+            boost = 2 / (2 - mon.boosts[stat])
+        # ((2 * base + 31) + 5) * boost
+        return ((2 * mon.base_stats[stat] + 31) + 5) * boost
 
-    if stay_best_a is None and valid_switch_idxs:
-        best_idx, best_tuple = None, (-1e9, -1e9)
-        for i in valid_switch_idxs:
-            mon = team_list[i]
-            new_types = getattr(mon, "types", []) or []
-            my_to_opp = best_type_effectiveness(new_types, opp)
-            opp_to_new = best_type_effectiveness(opp_types, mon)
-            cand = (my_to_opp - opp_to_new, my_to_opp)
-            if cand > best_tuple:
-                best_tuple, best_idx = cand, i
-        if best_idx is not None:
-            onehot[best_idx] = 1.0
-            return onehot
-        onehot[valid_switch_idxs[0]] = 1.0
-        return onehot
+    def _estimate_matchup(mon: Pokemon, opp: Pokemon) -> float:
+        score = max([opp.damage_multiplier(t) for t in mon.types if t is not None], default=1.0)
+        score -= max([mon.damage_multiplier(t) for t in opp.types if t is not None], default=1.0)
+        if mon.base_stats["spe"] > opp.base_stats["spe"]:
+            score += SPEED_TIER_COEFICIENT
+        elif opp.base_stats["spe"] > mon.base_stats["spe"]:
+            score -= SPEED_TIER_COEFICIENT
+        score += mon.current_hp_fraction * HP_FRACTION_COEFICIENT
+        score -= opp.current_hp_fraction * HP_FRACTION_COEFICIENT
+        return score
 
-    if stay_best_a is not None and stay_best_eff >= 1.0:
-        onehot[stay_best_a] = 1.0
-        return onehot
+    def _should_switch_out() -> bool:
+        # If there is a decent switch in...
+        if [m for m in (battle.available_switches or []) if _estimate_matchup(m, opponent) > 0]:
+            # ...and a 'good' reason to switch out
+            if active.boosts["def"] <= -3 or active.boosts["spd"] <= -3:
+                return True
+            if active.boosts["atk"] <= -3 and active.stats["atk"] >= active.stats["spa"]:
+                return True
+            if active.boosts["spa"] <= -3 and active.stats["atk"] <= active.stats["spa"]:
+                return True
+            if _estimate_matchup(active, opponent) < SWITCH_OUT_MATCHUP_THRESHOLD:
+                return True
+        return False
 
-    best_sw_idx, best_sw_score = None, -1e9
-    for i in valid_switch_idxs:
-        mon = team_list[i]
-        new_types = getattr(mon, "types", []) or []
-        my_to_opp = best_type_effectiveness(new_types, opp)
-        opp_to_new = best_type_effectiveness(opp_types, mon)
-        sw_score = my_to_opp - opp_to_new
-        if sw_score > best_sw_score:
-            best_sw_score, best_sw_idx = sw_score, i
+    # Rough estimation of damage ratio
+    physical_ratio = _stat_estimation(active, "atk") / max(_stat_estimation(opponent, "def"), 1e-9)
+    special_ratio = _stat_estimation(active, "spa") / max(_stat_estimation(opponent, "spd"), 1e-9)
 
-    if best_sw_idx is not None:
-        if (stay_best_a is None) or (best_sw_score > 0.5):
-            onehot[best_sw_idx] = 1.0
-            return onehot
+    avail_moves: List = (battle.available_moves or [])[:4]
+    avail_switches: List[Pokemon] = battle.available_switches or []
 
-    if stay_best_a is not None:
-        onehot[stay_best_a] = 1.0
-        return onehot
+    # If we can attack and shouldn't switch out (or cannot switch), pick a move
+    if avail_moves and (not _should_switch_out() or not avail_switches):
+        n_remaining_mons = len([m for m in battle.team.values() if m.fainted is False])
+        n_opp_remaining_mons = 6 - len([m for m in battle.opponent_team.values() if m.fainted is True])
 
-    if valid_switch_idxs:
-        onehot[valid_switch_idxs[0]] = 1.0
-    elif valid_moves:
-        onehot[valid_moves[0][0]] = 1.0
+        # Entry hazard setup/removal
+        for mv in avail_moves:
+            # Setup hazards if useful and not already present
+            if (
+                n_opp_remaining_mons >= 3
+                and mv.id in ENTRY_HAZARDS
+                and ENTRY_HAZARDS[mv.id] not in battle.opponent_side_conditions
+            ):
+                # Encode selected move
+                mi = next((i for i, m in enumerate(avail_moves) if m is mv), None)
+                if mi is not None:
+                    onehot[6 + mi] = 1.0
+                    return onehot
+
+            # Removal if we have side conditions and enough team remaining
+            if battle.side_conditions and mv.id in ANTI_HAZARDS_MOVES and n_remaining_mons >= 2:
+                mi = next((i for i, m in enumerate(avail_moves) if m is mv), None)
+                if mi is not None:
+                    onehot[6 + mi] = 1.0
+                    return onehot
+
+        # Setup/self-boosting if favorable
+        if active.current_hp_fraction == 1 and _estimate_matchup(active, opponent) > 0:
+            for mv in avail_moves:
+                boosts = getattr(mv, "boosts", None)
+                if (
+                    boosts
+                    and sum(boosts.values()) >= 2
+                    and getattr(mv, "target", None) == "self"
+                ):
+                    # ensure at least one boosted stat can still go up
+                    inc_stats = [s for s, v in boosts.items() if v > 0]
+                    if inc_stats and min([active.boosts[s] for s in inc_stats]) < 6:
+                        mi = next((i for i, m in enumerate(avail_moves) if m is mv), None)
+                        if mi is not None:
+                            onehot[6 + mi] = 1.0
+                            return onehot
+
+        # Best damaging move per heuristic
+        def move_score(mv) -> float:
+            stab = 1.5 if mv.type in active.types else 1.0
+            ratio = physical_ratio if mv.category == MoveCategory.PHYSICAL else special_ratio
+            acc = safe_accuracy(mv)
+            hits = getattr(mv, "expected_hits", 1)
+            mult = opponent.damage_multiplier(mv)
+            base = float(getattr(mv, "base_power", 0.0) or 0.0)
+            return base * stab * ratio * acc * hits * mult
+
+        best_move = max(avail_moves, key=move_score, default=None)
+        if best_move is not None:
+            mi = next((i for i, m in enumerate(avail_moves) if m is best_move), None)
+            if mi is not None and 0 <= mi < 4:
+                onehot[6 + mi] = 1.0
+                return onehot
+
+    # Otherwise, switch if possible
+    if avail_switches:
+        best_switch = max(avail_switches, key=lambda s: _estimate_matchup(s, opponent))
+        team_list = list(battle.team.values())[:6]
+        for i, mon in enumerate(team_list):
+            if mon is best_switch:
+                onehot[i] = 1.0
+                return onehot
+
+    # Final fallback: first valid option
+    if avail_moves:
+        onehot[6] = 1.0
+    elif avail_switches:
+        team_list = list(battle.team.values())[:6]
+        first_sw = avail_switches[0]
+        for i, mon in enumerate(team_list):
+            if mon is first_sw:
+                onehot[i] = 1.0
+                break
     return onehot
 
 class ShowdownEnvironment(BaseShowdownEnv):
